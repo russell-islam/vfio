@@ -21,8 +21,8 @@ mshv = ["mshv-ioctls", "mshv-bindings"]
 byteorder = ">=1.2.1"
 libc = ">=0.2.39"
 log = "0.4"
-kvm-bindings = { version = "~0", optional = true }
-kvm-ioctls = { version = "~0", optional = true }
+kvm-bindings = { git = "https://github.com/cloud-hypervisor/kvm-bindings", branch = "ch-v0.5.0", features = ["with-serde", "fam-wrappers"] }
+kvm-ioctls = { version = "0.11.0", optional = true }
 thiserror = ">=1.0"
 vfio-bindings = "~0"
 vm-memory = { version = ">=0.6", features = ["backend-mmap"] }
