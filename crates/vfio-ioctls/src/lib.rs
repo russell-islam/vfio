@@ -66,7 +66,7 @@ mod vfio_device;
 mod vfio_ioctls;
 
 pub use vfio_device::{
-    VfioContainer, VfioDevice, VfioGroup, VfioIrq, VfioRegion, VfioRegionInfoCap,
+    VfioContainer, VfioDevice, VfioDeviceFd, VfioGroup, VfioIrq, VfioRegion, VfioRegionInfoCap,
     VfioRegionInfoCapNvlink2Lnkspd, VfioRegionInfoCapNvlink2Ssatgt, VfioRegionInfoCapSparseMmap,
     VfioRegionInfoCapType, VfioRegionSparseMmapArea,
 };
@@ -107,10 +107,10 @@ pub enum VfioError {
     VfioDeviceGetRegionInfo(#[source] SysError),
     #[error("invalid file path")]
     InvalidPath,
-    #[error("failed to add guest memory map into iommu table")]
-    IommuDmaMap,
-    #[error("failed to remove guest memory map from iommu table")]
-    IommuDmaUnmap,
+    #[error("failed to add guest memory map into iommu table: {0}")]
+    IommuDmaMap(#[source] SysError),
+    #[error("failed to remove guest memory map from iommu table: {0}")]
+    IommuDmaUnmap(#[source] SysError),
     #[error("failed to get vfio device irq info")]
     VfioDeviceGetIrqInfo,
     #[error("failed to set vfio device irq")]
@@ -123,6 +123,14 @@ pub enum VfioError {
     VfioDeviceUnmaskIrq,
     #[error("failed to trigger vfio device irq")]
     VfioDeviceTriggerIrq,
+    #[error("failed to duplicate fd")]
+    VfioDeviceDupFd,
+    #[error("wrong device fd type")]
+    VfioDeviceFdWrongType,
+    #[error("failed to get host address")]
+    GetHostAddress,
+    #[error("invalid dma unmap size")]
+    InvalidDmaUnmapSize,
 }
 
 /// Specialized version of `Result` for VFIO subsystem.

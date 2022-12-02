@@ -23,6 +23,101 @@ use vmm_sys_util::eventfd::EventFd;
 use crate::fam::vec_with_array_field;
 use crate::vfio_ioctls::*;
 use crate::{Result, VfioError};
+#[cfg(all(feature = "kvm", not(test)))]
+use kvm_bindings::{
+    kvm_device_attr, KVM_DEV_VFIO_GROUP, KVM_DEV_VFIO_GROUP_ADD, KVM_DEV_VFIO_GROUP_DEL,
+};
+#[cfg(all(feature = "kvm", not(test)))]
+use kvm_ioctls::DeviceFd as KvmDeviceFd;
+#[cfg(all(feature = "mshv", target_arch = "x86_64", not(test)))]
+use mshv_bindings::{
+    mshv_device_attr, MSHV_DEV_VFIO_GROUP, MSHV_DEV_VFIO_GROUP_ADD, MSHV_DEV_VFIO_GROUP_DEL,
+};
+#[cfg(all(feature = "mshv", target_arch = "x86_64", not(test)))]
+use mshv_ioctls::DeviceFd as MshvDeviceFd;
+#[cfg(all(
+    any(feature = "kvm", all(feature = "mshv", target_arch = "x86_64")),
+    not(test)
+))]
+use std::os::unix::io::FromRawFd;
+
+#[derive(Debug)]
+enum DeviceFdInner {
+    #[cfg(all(feature = "kvm", not(test)))]
+    Kvm(KvmDeviceFd),
+    #[cfg(all(feature = "mshv", target_arch = "x86_64", not(test)))]
+    Mshv(MshvDeviceFd),
+}
+
+#[derive(Debug)]
+/// A wrapper for a device fd from either KVM or MSHV.
+pub struct VfioDeviceFd(DeviceFdInner);
+
+impl VfioDeviceFd {
+    /// Create an VfioDeviceFd from a KVM DeviceFd
+    #[cfg(all(feature = "kvm", not(test)))]
+    pub fn new_from_kvm(fd: KvmDeviceFd) -> Self {
+        VfioDeviceFd(DeviceFdInner::Kvm(fd))
+    }
+    /// Extract the KVM DeviceFd from an VfioDeviceFd
+    #[cfg(all(feature = "kvm", not(test)))]
+    pub fn to_kvm(self) -> Result<KvmDeviceFd> {
+        match self {
+            VfioDeviceFd(DeviceFdInner::Kvm(fd)) => Ok(fd),
+            #[allow(unreachable_patterns)]
+            _ => Err(VfioError::VfioDeviceFdWrongType),
+        }
+    }
+    /// Create an VfioDeviceFd from an MSHV DeviceFd
+    #[cfg(all(feature = "mshv", target_arch = "x86_64", not(test)))]
+    pub fn new_from_mshv(fd: MshvDeviceFd) -> Self {
+        VfioDeviceFd(DeviceFdInner::Mshv(fd))
+    }
+    /// Extract the MSHV DeviceFd from an VfioDeviceFd
+    #[cfg(all(feature = "mshv", target_arch = "x86_64", not(test)))]
+    pub fn to_mshv(self) -> Result<MshvDeviceFd> {
+        match self {
+            VfioDeviceFd(DeviceFdInner::Mshv(fd)) => Ok(fd),
+            #[allow(unreachable_patterns)]
+            _ => Err(VfioError::VfioDeviceFdWrongType),
+        }
+    }
+    /// Try to duplicate an VfioDeviceFd
+    #[cfg(all(
+        any(feature = "kvm", all(feature = "mshv", target_arch = "x86_64")),
+        not(test)
+    ))]
+    pub fn try_clone(&self) -> Result<Self> {
+        match &self.0 {
+            #[cfg(feature = "kvm")]
+            DeviceFdInner::Kvm(fd) => {
+                // SAFETY: FFI call to libc
+                let dup_fd = unsafe { libc::dup(fd.as_raw_fd()) };
+                if dup_fd == -1 {
+                    Err(VfioError::VfioDeviceDupFd)
+                } else {
+                    // SAFETY: dup_fd is a valid device fd for KVM
+                    let kvm_fd = unsafe { KvmDeviceFd::from_raw_fd(dup_fd) };
+                    Ok(VfioDeviceFd(DeviceFdInner::Kvm(kvm_fd)))
+                }
+            }
+            #[cfg(all(feature = "mshv", target_arch = "x86_64"))]
+            DeviceFdInner::Mshv(fd) => {
+                // SAFETY: FFI call to libc
+                let dup_fd = unsafe { libc::dup(fd.as_raw_fd()) };
+                if dup_fd == -1 {
+                    Err(VfioError::VfioDeviceDupFd)
+                } else {
+                    // SAFETY: dup_fd is a valid device fd for MSHV
+                    let mshv_fd = unsafe { MshvDeviceFd::from_raw_fd(dup_fd) };
+                    Ok(VfioDeviceFd(DeviceFdInner::Mshv(mshv_fd)))
+                }
+            }
+        }
+    }
+}
+
+pub type VfioContainerDeviceHandle = Arc<VfioDeviceFd>;
 
 #[repr(C)]
 #[derive(Debug, Default)]
@@ -58,8 +153,6 @@ impl vfio_region_info_with_cap {
     }
 }
 
-pub use self::hypervisor::VfioContainerDeviceHandle;
-
 /// A safe wrapper over a VFIO container object.
 ///
 /// A VFIO container represents an IOMMU domain, or a set of IO virtual address translation tables.
@@ -73,7 +166,7 @@ pub use self::hypervisor::VfioContainerDeviceHandle;
 pub struct VfioContainer {
     pub(crate) container: File,
     #[allow(dead_code)]
-    pub(crate) device_fd: VfioContainerDeviceHandle,
+    pub(crate) device_fd: Option<VfioContainerDeviceHandle>,
     pub(crate) groups: Mutex<HashMap<u32, Arc<VfioGroup>>>,
 }
 
@@ -81,8 +174,8 @@ impl VfioContainer {
     /// Create a container wrapper object.
     ///
     /// # Arguments
-    /// * `device_fd`: file handle of the VFIO device.
-    pub fn new(device_fd: VfioContainerDeviceHandle) -> Result<Self> {
+    /// * `device_fd`: An optional file handle of the hypervisor VFIO device.
+    pub fn new(device_fd: Option<VfioContainerDeviceHandle>) -> Result<Self> {
         let container = OpenOptions::new()
             .read(true)
             .write(true)
@@ -139,19 +232,20 @@ impl VfioContainer {
         let group = Arc::new(VfioGroup::new(group_id)?);
 
         // Bind the new group object to the container.
-        vfio_syscall::set_group_container(&*group, self)?;
+        vfio_syscall::set_group_container(&group, self)?;
 
         // Initialize the IOMMU backend driver after binding the first group object.
         if hash.len() == 0 {
             if let Err(e) = self.set_iommu(VFIO_TYPE1v2_IOMMU) {
-                let _ = vfio_syscall::unset_group_container(&*group, self);
+                let _ = vfio_syscall::unset_group_container(&group, self);
                 return Err(e);
             }
         }
 
         // Add the new group object to the hypervisor driver.
+        #[cfg(any(feature = "kvm", all(feature = "mshv", target_arch = "x86_64")))]
         if let Err(e) = self.device_add_group(&group) {
-            let _ = vfio_syscall::unset_group_container(&*group, self);
+            let _ = vfio_syscall::unset_group_container(&group, self);
             return Err(e);
         }
 
@@ -170,6 +264,7 @@ impl VfioContainer {
         // - one reference cloned in VfioDevice.drop() and passed into here
         // - one reference held by the groups hashmap
         if Arc::strong_count(&group) == 3 {
+            #[cfg(any(feature = "kvm", all(feature = "mshv", target_arch = "x86_64")))]
             match self.device_del_group(&group) {
                 Ok(_) => {}
                 Err(e) => {
@@ -177,7 +272,7 @@ impl VfioContainer {
                     return;
                 }
             }
-            if vfio_syscall::unset_group_container(&*group, self).is_err() {
+            if vfio_syscall::unset_group_container(&group, self).is_err() {
                 error!("Could not unbind VFIO group: {:?}", group.id());
                 return;
             }
@@ -218,7 +313,7 @@ impl VfioContainer {
 
         vfio_syscall::unmap_dma(self, &mut dma_unmap)?;
         if dma_unmap.size != size {
-            return Err(VfioError::IommuDmaUnmap);
+            return Err(VfioError::InvalidDmaUnmapSize);
         }
 
         Ok(())
@@ -232,7 +327,7 @@ impl VfioContainer {
         mem.iter().try_for_each(|region| {
             let host_addr = region
                 .get_host_address(MemoryRegionAddress(0))
-                .map_err(|_| VfioError::IommuDmaMap)?;
+                .map_err(|_| VfioError::GetHostAddress)?;
             self.vfio_dma_map(
                 region.start_addr().raw_value(),
                 region.len() as u64,
@@ -253,116 +348,90 @@ impl VfioContainer {
             self.vfio_dma_unmap(region.start_addr().raw_value(), region.len() as u64)
         })
     }
-}
 
-#[cfg(all(feature = "kvm", not(test)))]
-// Methods to support the KVM hypervisor.
-// Note: a special stub implementation is used for VFIO unit tests, so following code won't covered
-// by unit tests, be careful when review changes.
-mod hypervisor {
-    use super::*;
-    use kvm_bindings::{
-        kvm_device_attr, KVM_DEV_VFIO_GROUP, KVM_DEV_VFIO_GROUP_ADD, KVM_DEV_VFIO_GROUP_DEL,
-    };
-    use kvm_ioctls::DeviceFd;
+    #[cfg(all(
+        any(feature = "kvm", all(feature = "mshv", target_arch = "x86_64")),
+        not(test)
+    ))]
+    fn device_set_group(&self, group: &VfioGroup, add: bool) -> Result<()> {
+        let group_fd_ptr = &group.as_raw_fd() as *const i32;
 
-    /// Type for device file handle passed to VfioContainer::new();
-    pub type VfioContainerDeviceHandle = Arc<DeviceFd>;
-
-    impl VfioContainer {
-        pub(crate) fn device_add_group(&self, group: &VfioGroup) -> Result<()> {
-            let group_fd_ptr = &group.as_raw_fd() as *const i32;
-            let dev_attr = kvm_device_attr {
-                flags: 0,
-                group: KVM_DEV_VFIO_GROUP,
-                attr: u64::from(KVM_DEV_VFIO_GROUP_ADD),
-                addr: group_fd_ptr as u64,
-            };
-
-            self.device_fd
-                .set_device_attr(&dev_attr)
-                .map_err(VfioError::SetDeviceAttr)
-        }
-
-        pub(crate) fn device_del_group(&self, group: &VfioGroup) -> Result<()> {
-            let group_fd_ptr = &group.as_raw_fd() as *const i32;
-            let dev_attr = kvm_device_attr {
-                flags: 0,
-                group: KVM_DEV_VFIO_GROUP,
-                attr: u64::from(KVM_DEV_VFIO_GROUP_DEL),
-                addr: group_fd_ptr as u64,
-            };
-
-            self.device_fd
-                .set_device_attr(&dev_attr)
-                .map_err(VfioError::SetDeviceAttr)
-        }
-    }
-}
-
-#[cfg(all(feature = "mshv", not(feature = "kvm"), not(test)))]
-// Methods to support the Microsoft HyperVisor.
-// Note: a special stub implementation is used for VFIO unit tests, so following code won't covered
-// by unit tests, be careful when review changes.
-mod hypervisor {
-    use super::*;
-    use mshv_bindings::{
-        mshv_device_attr, MSHV_DEV_VFIO_GROUP, MSHV_DEV_VFIO_GROUP_ADD, MSHV_DEV_VFIO_GROUP_DEL,
-    };
-    use mshv_ioctls::DeviceFd;
-
-    /// Type for device file handle passed to VfioContainer::new();
-    pub type VfioContainerDeviceHandle = Arc<DeviceFd>;
-
-    impl VfioContainer {
-        pub(crate) fn device_add_group(&self, group: &VfioGroup) -> Result<()> {
-            let group_fd_ptr = &group.as_raw_fd() as *const i32;
-            let dev_attr = mshv_device_attr {
-                flags: 0,
-                group: MSHV_DEV_VFIO_GROUP,
-                attr: u64::from(MSHV_DEV_VFIO_GROUP_ADD),
-                addr: group_fd_ptr as u64,
-            };
-
-            self.device_fd
-                .set_device_attr(&dev_attr)
-                .map_err(VfioError::SetDeviceAttr)
-        }
-
-        pub(crate) fn device_del_group(&self, group: &VfioGroup) -> Result<()> {
-            let group_fd_ptr = &group.as_raw_fd() as *const i32;
-            let dev_attr = mshv_device_attr {
-                flags: 0,
-                group: MSHV_DEV_VFIO_GROUP,
-                attr: u64::from(MSHV_DEV_VFIO_GROUP_DEL),
-                addr: group_fd_ptr as u64,
-            };
-
-            self.device_fd
-                .set_device_attr(&dev_attr)
-                .map_err(VfioError::SetDeviceAttr)
-        }
-    }
-}
-
-#[cfg(any(test, all(not(feature = "mshv"), not(feature = "kvm"))))]
-// Methods to support user mode driver, which has no associated hypervisors.
-// This implementation also acts a stub for VFIO unit tests to avoid dependency on platform
-// hardware configuration.
-mod hypervisor {
-    use super::*;
-
-    /// Type for device file handle passed to VfioContainer::new();
-    pub type VfioContainerDeviceHandle = ();
-
-    impl VfioContainer {
-        pub(crate) fn device_add_group(&self, _group: &VfioGroup) -> Result<()> {
+        if let Some(device_fd) = self.device_fd.as_ref() {
+            match &device_fd.0 {
+                #[cfg(feature = "kvm")]
+                DeviceFdInner::Kvm(fd) => {
+                    let flag = if add {
+                        KVM_DEV_VFIO_GROUP_ADD
+                    } else {
+                        KVM_DEV_VFIO_GROUP_DEL
+                    };
+                    let dev_attr = kvm_device_attr {
+                        flags: 0,
+                        group: KVM_DEV_VFIO_GROUP,
+                        attr: u64::from(flag),
+                        addr: group_fd_ptr as u64,
+                    };
+                    fd.set_device_attr(&dev_attr)
+                        .map_err(VfioError::SetDeviceAttr)
+                }
+                #[cfg(all(feature = "mshv", target_arch = "x86_64"))]
+                DeviceFdInner::Mshv(fd) => {
+                    let flag = if add {
+                        MSHV_DEV_VFIO_GROUP_ADD
+                    } else {
+                        MSHV_DEV_VFIO_GROUP_DEL
+                    };
+                    let dev_attr = mshv_device_attr {
+                        flags: 0,
+                        group: MSHV_DEV_VFIO_GROUP,
+                        attr: u64::from(flag),
+                        addr: group_fd_ptr as u64,
+                    };
+                    fd.set_device_attr(&dev_attr)
+                        .map_err(VfioError::SetDeviceAttr)
+                }
+            }
+        } else {
             Ok(())
         }
+    }
 
-        pub(crate) fn device_del_group(&self, _group: &VfioGroup) -> Result<()> {
-            Ok(())
-        }
+    /// Add a device to a VFIO group
+    ///
+    /// The VFIO device fd should have been set.
+    ///
+    /// # Parameters
+    /// * group: target VFIO group
+    #[cfg(all(
+        any(feature = "kvm", all(feature = "mshv", target_arch = "x86_64")),
+        not(test)
+    ))]
+    fn device_add_group(&self, group: &VfioGroup) -> Result<()> {
+        self.device_set_group(group, true)
+    }
+
+    /// Delete a device from a VFIO group
+    ///
+    /// The VFIO device fd should have been set.
+    ///
+    /// # Parameters
+    /// * group: target VFIO group
+    #[cfg(all(
+        any(feature = "kvm", all(feature = "mshv", target_arch = "x86_64")),
+        not(test)
+    ))]
+    fn device_del_group(&self, group: &VfioGroup) -> Result<()> {
+        self.device_set_group(group, false)
+    }
+
+    #[cfg(test)]
+    fn device_add_group(&self, _group: &VfioGroup) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn device_del_group(&self, _group: &VfioGroup) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -447,7 +516,7 @@ impl AsRawFd for VfioGroup {
 }
 
 /// Represent one area of the sparse mmap
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct VfioRegionSparseMmapArea {
     /// Offset of mmap'able area within region
     pub offset: u64,
@@ -456,14 +525,14 @@ pub struct VfioRegionSparseMmapArea {
 }
 
 /// List of sparse mmap areas
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VfioRegionInfoCapSparseMmap {
     /// List of areas
     pub areas: Vec<VfioRegionSparseMmapArea>,
 }
 
 /// Represent a specific device by providing type and subtype
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct VfioRegionInfoCapType {
     /// Device type
     pub type_: u32,
@@ -472,21 +541,21 @@ pub struct VfioRegionInfoCapType {
 }
 
 /// Carry NVLink SSA TGT information
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct VfioRegionInfoCapNvlink2Ssatgt {
     /// TGT value
     pub tgt: u64,
 }
 
 /// Carry NVLink link speed information
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct VfioRegionInfoCapNvlink2Lnkspd {
     /// Link speed value
     pub link_speed: u32,
 }
 
 /// List of capabilities that can be related to a region.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VfioRegionInfoCap {
     /// Sparse memory mapping type
     SparseMmap(VfioRegionInfoCapSparseMmap),
@@ -510,7 +579,7 @@ pub struct VfioRegion {
 }
 
 /// Information about VFIO interrupts.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct VfioIrq {
     /// Flags for irq.
     pub flags: u32,
@@ -601,17 +670,21 @@ impl VfioDeviceInfo {
             let info_ptr = &region_with_cap[0] as *const vfio_region_info_with_cap as *const u8;
 
             while next_cap_offset >= region_info_size {
+                // SAFETY: data structure returned by kernel is trusted.
                 let cap_header = unsafe {
                     *(info_ptr.offset(next_cap_offset as isize) as *const vfio_info_cap_header)
                 };
 
                 match u32::from(cap_header.id) {
                     VFIO_REGION_INFO_CAP_SPARSE_MMAP => {
+                        // SAFETY: data structure returned by kernel is trusted.
                         let sparse_mmap = unsafe {
                             info_ptr.offset(next_cap_offset as isize)
                                 as *const vfio_region_info_cap_sparse_mmap
                         };
+                        // SAFETY: data structure returned by kernel is trusted.
                         let nr_areas = unsafe { (*sparse_mmap).nr_areas };
+                        // SAFETY: data structure returned by kernel is trusted.
                         let areas = unsafe { (*sparse_mmap).areas.as_slice(nr_areas as usize) };
 
                         let cap = VfioRegionInfoCapSparseMmap {
@@ -626,6 +699,7 @@ impl VfioDeviceInfo {
                         region.caps.push(VfioRegionInfoCap::SparseMmap(cap));
                     }
                     VFIO_REGION_INFO_CAP_TYPE => {
+                        // SAFETY: data structure returned by kernel is trusted.
                         let type_ = unsafe {
                             *(info_ptr.offset(next_cap_offset as isize)
                                 as *const vfio_region_info_cap_type)
@@ -640,6 +714,7 @@ impl VfioDeviceInfo {
                         region.caps.push(VfioRegionInfoCap::MsixMappable);
                     }
                     VFIO_REGION_INFO_CAP_NVLINK2_SSATGT => {
+                        // SAFETY: data structure returned by kernel is trusted.
                         let nvlink2_ssatgt = unsafe {
                             *(info_ptr.offset(next_cap_offset as isize)
                                 as *const vfio_region_info_cap_nvlink2_ssatgt)
@@ -650,6 +725,7 @@ impl VfioDeviceInfo {
                         region.caps.push(VfioRegionInfoCap::Nvlink2Ssatgt(cap));
                     }
                     VFIO_REGION_INFO_CAP_NVLINK2_LNKSPD => {
+                        // SAFETY: data structure returned by kernel is trusted.
                         let nvlink2_lnkspd = unsafe {
                             *(info_ptr.offset(next_cap_offset as isize)
                                 as *const vfio_region_info_cap_nvlink2_lnkspd)
@@ -836,7 +912,7 @@ impl VfioDevice {
             // irq_set.data could be none, bool or fd according to flags, so irq_set.data
             // is u8 default, here irq_set.data is a vector of fds as u32, so 4 default u8
             // are combined together as u32 for each fd.
-            // It is safe as enough space is reserved through
+            // SAFETY: It is safe as enough space is reserved through
             // vec_with_array_field(u32)<event_fds.len()>.
             let fds = unsafe {
                 irq_set[0]
@@ -983,14 +1059,13 @@ impl VfioDevice {
     /// * `buf`: data destination and buf length is read size
     /// * `addr`: offset in the region
     pub fn region_read(&self, index: u32, buf: &mut [u8], addr: u64) {
-        let region: &VfioRegion;
-        match self.regions.get(index as usize) {
-            Some(v) => region = v,
+        let region: &VfioRegion = match self.regions.get(index as usize) {
+            Some(v) => v,
             None => {
                 warn!("region read with invalid index: {}", index);
                 return;
             }
-        }
+        };
 
         let size = buf.len() as u64;
         if size > region.size || addr + size > region.size {
@@ -1016,14 +1091,13 @@ impl VfioDevice {
     /// * `buf`: data src and buf length is write size
     /// * `addr`: offset in the region
     pub fn region_write(&self, index: u32, buf: &[u8], addr: u64) {
-        let stub: &VfioRegion;
-        match self.regions.get(index as usize) {
-            Some(v) => stub = v,
+        let stub: &VfioRegion = match self.regions.get(index as usize) {
+            Some(v) => v,
             None => {
                 warn!("region write with invalid index: {}", index);
                 return;
             }
-        }
+        };
 
         let size = buf.len() as u64;
         if size > stub.size
@@ -1074,10 +1148,11 @@ impl AsRawFd for VfioDevice {
 
 impl Drop for VfioDevice {
     fn drop(&mut self) {
-        // Safe because we own the File object.
         // ManuallyDrop is needed here because we need to ensure that VfioDevice::device is closed
         // before dropping VfioDevice::group, otherwise it will cause EBUSY when putting the
         // group object.
+
+        // SAFETY: we own the File object.
         unsafe {
             ManuallyDrop::drop(&mut self.device);
         }
@@ -1089,6 +1164,7 @@ impl Drop for VfioDevice {
 mod tests {
     use super::*;
     use std::mem::size_of;
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
     use vmm_sys_util::tempfile::TempFile;
 
     impl VfioGroup {
@@ -1189,7 +1265,7 @@ mod tests {
 
         VfioContainer {
             container,
-            device_fd: (),
+            device_fd: None,
             groups: Mutex::new(HashMap::new()),
         }
     }
@@ -1352,5 +1428,26 @@ mod tests {
         assert_ne!(v8, v2.clone());
         assert_ne!(v8, v4.clone());
         assert_ne!(v8, v6.clone());
+    }
+
+    #[test]
+    fn test_vfio_map_guest_memory() {
+        let addr1 = GuestAddress(0x1000);
+        let mem1 = GuestMemoryMmap::<()>::from_ranges(&[(addr1, 0x1000)]).unwrap();
+        let container = create_vfio_container();
+
+        container.vfio_map_guest_memory(&mem1).unwrap();
+
+        let addr2 = GuestAddress(0x3000);
+        let mem2 = GuestMemoryMmap::<()>::from_ranges(&[(addr2, 0x1000)]).unwrap();
+
+        container.vfio_unmap_guest_memory(&mem2).unwrap_err();
+
+        let addr3 = GuestAddress(0x1000);
+        let mem3 = GuestMemoryMmap::<()>::from_ranges(&[(addr3, 0x2000)]).unwrap();
+
+        container.vfio_unmap_guest_memory(&mem3).unwrap_err();
+
+        container.vfio_unmap_guest_memory(&mem1).unwrap();
     }
 }
